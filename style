@@ -1,0 +1,1064 @@
+
+# ============================================================
+# Лекция 3. Метод k-ближайших соседей для задач классификации и регрессии
+# ============================================================
+
+# In [47]
+import sklearn
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+warnings.filterwarnings('ignore')
+%config InlineBackend.figure_format = 'retina'
+
+# In [48]
+# @title
+# Фиксируем генератор случайных чисел, чтобы результаты воспроизводились.
+rng = np.random.default_rng(42)
+n_sessions = 900
+is_attack = rng.binomial(1, 0.28, size=n_sessions)
+# Распределения намеренно перекрываются: задача не должна быть тривиальной.
+duration_s = rng.lognormal(
+    mean=np.where(is_attack == 1, 4.7, 4.4),
+    sigma=np.where(is_attack == 1, 0.75, 0.65),
+)
+bytes_kb = rng.lognormal(
+    mean=np.where(is_attack == 1, 7.1, 7.0),
+    sigma=1.0,
+)
+unique_dst_ports = rng.poisson(lam=np.where(is_attack == 1, 8.0, 2.3)) + 1
+connections_per_min = rng.gamma(
+    shape=np.where(is_attack == 1, 4.0, 2.2),
+    scale=np.where(is_attack == 1, 3.2, 2.2),
+)
+source_risk_score = np.where(
+    is_attack == 1,
+    rng.beta(5.0, 2.2, size=n_sessions),
+    rng.beta(2.0, 5.0, size=n_sessions),
+)
+off_hours = rng.binomial(
+    1,
+    np.where(is_attack == 1, 0.62, 0.27),
+)
+payload_entropy = np.clip(
+    rng.normal(
+        # ... (код обрывается в исходном документе)
+    )
+)
+
+# In [50]
+from sklearn.model_selection import train_test_split
+# Определяем список входных признаков.
+feature_columns = ["duration_s", "bytes_kb", "failed_logins", "unique_dst_ports", "connections_per_min", "source_risk_score", "off_hours", "payload_entropy"]
+# Формируем матрицу признаков и два массива целевых переменных.
+X = df[feature_columns]
+y_class = df["is_attack"]
+y_reg = df["investigation_time_min"]
+# Одновременно (чтобы наборы индексой соблюдали)
+# разделяем признаки и обе целевые переменные ина обучающие и тестовые
+(X_train, X_test, y_class_train, y_class_test, y_reg_train, y_reg_test) = train_test_split(X, y_class, y_reg, test_size = 0.25, random_state = 42, stratify = y_class)
+# Контролируем размеры и долю атак после разбиения.
+print(f"Обучающая выборка: {X_train.shape}")
+print(f"Тестовая выборка: {X_test.shape}")
+print(f"Доля атак в обучающей выборке: {y_class_train.mean():.3f}")
+print(f"Доля атак в тестовой выборке: {y_class_test.mean():.3f}")
+
+# In [52]
+from sklearn.neighbors import KNeighborsClassifier
+knn_example = KNeighborsClassifier()
+
+# In [54]
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import KNeighborsClassifier
+# Объединяем масштабирование и классификацию в единый конвейер.
+classification_pipeline = Pipeline([
+    # На каждой итерации кросс-валидации StandardScaler будет
+    # настраиваться только по обучающим блокам текущей итерации.
+    ("scaler", StandardScaler()),
+    # После масштабирования выполнятся поиск ближайших соседей.
+    ("knn", KNeighborsClassifier())
+])
+classification_pipeline
+
+# In [55]
+from sklearn.model_selection import StratifiedKFold
+# Задаём одинаковые блоки кросс-валидации для корректного сравнения моделей.
+classification_cv = StratifiedKFold(n_splits = 5, shuffle = True, random_state = 42)
+classification_cv
+
+# In [56]
+from sklearn.model_selection import cross_validate
+# Значения количества соседей, которые необходимо проверить.
+k_values = [1, 3, 5, 7, 9, 11, 15, 21, 31, 41]
+# В этой таблице будут накапливаться результаты для разных k.
+validation_results = []
+for k in k_values:
+    # Масштабирование включено в Pipeline.
+    # Поэтому на каждой итерации кросс-валидации StandardScaler
+    # настраивается только по обучающим блокам.
+    model = Pipeline([("scaler", StandardScaler()),
+                      ("knn", KNeighborsClassifier(n_neighbors = k,
+                                                   weights = "uniform",
+                                                   p = 2))])
+
+# In [57]
+# Находим строку с максимальной средней валидационной F1.
+best_mean_position = (validation_results_df["mean_validation_f1"].idxmax())
+best_mean_row = validation_results_df.loc[best_mean_position]
+# Сохраняем максимальную среднюю F1 и её стандартную ошибку.
+maximum_validation_f1 = best_mean_row["mean_validation_f1"]
+standard_error_of_best = best_mean_row["standard_error"]
+k_with_maximum_f1 = int(best_mean_row["k"])
+# Вычисляем нижнюю границу по правилу одной стандартной ошибки.
+# Кандидатами считаются значения k, для которых средняя
+# валидационная F1 отличается от максимума не более чем
+# на одну стандартную ошибку лучшего результата.
+one_se_threshold = (maximum_validation_f1 - standard_error_of_best)
+# Отбираем значения k, F1 не меньше
+# одной стандартной ошибки от максимума.
+candidate_models = validation_results_df[
+    validation_results_df["mean_validation_f1"]>= one_se_threshold].copy()
+candidate_models
+
+# In [58]
+# Среди полученных допустимых кандидатов последовательно учитываем:
+# 1. Устойчивость качества между блоками (чем меньше СКО, тем устойчивее);
+# 2. Разрыв между обучающей и валидационной F1 (чем меньше, тем лучше);
+# 3. Среднюю валидационную F1 (чем больше, тем лучше);
+# 4. Величину k (при остальных равных условиях выбрать больше k,
+# как более сглаженный вариант).
+candidate_models = candidate_models.sort_values(by = ["std_validation_f1", "train_validation_gap", "mean_validation_f1", "k"],
+                                                ascending = [True, # минимальный разброс F1 между блоками;
+                                                             True, # минимальный разрыв между кривыми;
+                                                             False, # максимальная средняя валидационная F1;
+                                                             False]) # больше k при остальных равных условиях.
+# Первая строка после сортировки соответствует
+# выбранному значению количества соседей.
+selected_row = candidate_models.iloc[0]
+best_k = int(selected_row["k"])
+print(f"Максимальная средняя валидационная F1: "
+      f"{maximum_validation_f1:.4f}")
+print(f"Стандартная ошибка максимальной F1: "
+      f"{standard_error_of_best:.4f}")
+print(f"Нижняя граница по правилу одной стандартной ошибки: "
+      f"{one_se_threshold:.4f}")
+print(f"k с максимальной средней F1: {k_with_maximum_f1}")
+print(f"\nВыбранное k: {best_k}")
+print(f"Для выбранного k:")
+print(f"Средняя валидационная F1: "
+      f"{selected_row['mean_validation_f1']:.4f}")
+print(f"Стандартное отклонение между блоками: "
+      f"{selected_row['std_validation_f1']:.4f}")
+print(f"Разрыв для выбранного k: "
+      f"{selected_row['train_validation_gap']:.4f}")
+
+# In [59]
+plt.figure(figsize=(6, 4))
+plt.plot(validation_results_df["k"],
+         validation_results_df["mean_train_f1"],
+         marker="o", linewidth=2, label="Обучающая F1")
+# Показываем нижнюю границу правила одной стандартной ошибки.
+plt.axhline(y = one_se_threshold, color = "r",
+            linestyle = ":", linewidth = 2,
+            label = "Граница одной стандартной ошибки")
+# Отмечаем k с формально максимальной валидационной F1.
+plt.axvline(x = k_with_maximum_f1, color = "gray",
+            linestyle = "-.", linewidth=2,
+            label = f"Максимальная F1: k = {k_with_maximum_f1}")
+# Отмечаем окончательно выбранное значение k.
+plt.axvline(x = best_k, color = "green",
+            linestyle = "--", linewidth = 2,
+            label = f"Выбранное k = {best_k}")
+plt.xlabel("Количество соседей k")
+plt.ylabel("F1 атакующего класса")
+plt.title("Выбор количества соседей с учётом качества и устойчивости")
+plt.xticks(k_values)
+plt.legend()
+plt.tight_layout()
+
+# In [61]
+from sklearn.model_selection import GridSearchCV
+# Создаём конвейер: параметры масштабирования вычисляются внутри каждого блока CV.
+classification_pipeline = Pipeline([("scaler", StandardScaler()), ("knn", KNeighborsClassifier())])
+# Задаём умеренную сетку допустимых значений гиперпараметров.
+classification_param_grid = {"knn__n_neighbors": k_values, "knn__weights": ["uniform", "distance"], "knn__p": [1, 2]}
+# Подбираем параметры только по обучающей выборке.
+classification_search = GridSearchCV(estimator = classification_pipeline, param_grid = classification_param_grid, scoring = "f1", cv = classification_cv, return_train_score = True)
+classification_search.fit(X_train, y_class_train)
+# Выводим лучший вариант и несколько лидирующих комбинаций.
+print("Лучшие параметры:", classification_search.best_params_)
+print(f"Лучшая средняя валидационная F1 на CV: {classification_search.best_score_:.3f}")
+classification_cv_results = pd.DataFrame(classification_search.cv_results_)
+top_columns = ["param_knn__n_neighbors", "param_knn__weights", "param_knn__p", "mean_train_score", "mean_test_score", "std_test_score"]
+print("\nЛучшие комбинации:")
+# Сортируем комбинации от лучшего ранга к худшему.
+# rank_test_score - это ранг каждой комбинации гиперпараметров в рейтинге,
+# который автоматически формирует GridSearchCV () - .cv_results_
+# rank_test_score формируется только по средней валидационной метрике.
+classification_cv_results.sort_values("rank_test_score") \
+    .loc[:, top_columns].head(8).round(3)
+
+# In [61]
+best_classification_model = classification_search.best_estimator_
+best_classification_model
+
+# In [62]
+from sklearn.metrics import (ConfusionMatrixDisplay, classification_report, f1_score, precision_score, recall_score)
+# Получаем прогнозы лучшей модели на ранее не использовавшейся тестовой выборке.
+y_class_pred = best_classification_model.predict(X_test)
+print(classification_report(y_class_test, y_class_pred, target_names = ["Легитимная", "Атака"]))
+# Визуализируем абсолютное число ошибок каждого типа.
+ConfusionMatrixDisplay.from_predictions(
+    y_class_test,
+    y_class_pred,
+    display_labels=["Легитимная", "Атака"],
+    cmap="Blues",
+    colorbar=False
+)
+plt.title("Матрица ошибок kNN-классификатора")
+plt.tight_layout()
+plt.show()
+
+# In [63]
+def show_table(title, df):
+    from IPython.display import display, Markdown
+    display(Markdown(f"## {title}"))
+    display(df)
+
+# In [64]
+# Получаем локальные доли голосов классов для всех тестовых объектов.
+attack_vote_share = best_classification_model.predict_proba(X_test)[:, 1]
+# Находим наиболее неопределённый объект: его доля ближе всего к 0.5.
+uncertain_position = int(np.argmin(np.abs(attack_vote_share - 0.5)))
+uncertain_index = X_test.index[uncertain_position]
+uncertain_object = X_test.iloc[[uncertain_position]]
+# Извлекаем отдельные этапы конвейера для анализа соседей.
+# nated_steps — это словарь всех шагов пайпайна.
+# Нужно, чтобы применить к новому объекту точно такое же преобразование,
+# какое использовалось при обучении.
+fitted_scaler = best_classification_model.named_steps["scaler"]
+# "Достаём" обученный классификатор kNN из пайпайна.
+fitted_knn = best_classification_model.named_steps["knn"]
+# Применяем масштабирование к новому объекту
+uncertain_scaled = fitted_scaler.transform(uncertain_object)
+# Вычисляем расстояния до ближайших соседей и находим их индексы
+distances, neighbor_positions = fitted_knn.kneighbors(uncertain_scaled)
+# Формируем таблицу ближайших обучающих сессий.
+neighbor_positions = neighbor_positions[0]
+neighbor_table = X_train.iloc[neighbor_positions].copy()
+neighbor_table["is_attack"] = y_class_train.iloc[neighbor_positions].to_numpy()
+neighbor_table["distance"] = distances[0]
+neighbor_table = neighbor_table.sort_values("distance")
+# Отобразим в таблице три признака, которые наиболее понятны
+# для краткой интерпретации подозрительной активности:
+# число неуспешных входов;
+# число уникальных портов назначения;
+# оценка риска источника.
+show_table("Анализируемая сессия", uncertain_object[["failed_logins", "unique_dst_ports", "source_risk_score"]].round(3))
+show_table("Ближайшие обучающие сессии", neighbor_table[["failed_logins", "unique_dst_ports", "source_risk_score"]].round(3))
+show_table("Ближайшие обучающие сессии", neighbor_table[["failed_logins", "unique_dst_ports", "source_risk_score", "is_attack", "distance"]].round(3))
+
+# In [65]
+import time
+# Масштабируем данные один раз, поскольку здесь сравнивается только способ поиска.
+timing_scaler = StandardScaler()
+X_train_scaled = timing_scaler.fit_transform(X_train)
+X_test_scaled = timing_scaler.transform(X_test)
+# Используем лучшие найденные значения k, weights и p для всех вариантов поиска.
+best_knn_params = classification_search.best_params_
+search_algorithms = ["brute", "kd_tree", "ball_tree"]
+timing_rows = []
+predictions_by_algorithm = {}
+for algorithm in search_algorithms:
+    search_model = KNeighborsClassifier(n_neighbors = best_knn_params["knn__n_neighbors"],
+                                        weights = best_knn_params["knn__weights"],
+                                        p = best_knn_params["knn__p"],
+                                        algorithm = algorithm)
+    # Измеряем построение внутренней структуры поиска.
+    fit_start = time.perf_counter()
+    search_model.fit(X_train_scaled, y_class_train)
+    fit_ms = (time.perf_counter() - fit_start) * 1000
+    # Повторяем прогноз, чтобы уменьшить влияние погрешности таймера.
+    repetitions = 30
+    predict_start = time.perf_counter()
+    for _ in range(repetitions):
+        current_prediction = search_model.predict(X_test_scaled)
+    predict_ms = (time.perf_counter() - predict_start) * 1000 / repetitions
+    predictions_by_algorithm[algorithm] = current_prediction
+    timing_rows.append({"Алгоритм": algorithm,
+                        "Время обучения, мс": fit_ms,
+                        "Время формирования прогноза, мс": predict_ms})
+# Проверяем соблюдение прогнозов с полным перебором.
+brute_prediction = predictions_by_algorithm["brute"]
+for algorithm in ["kd_tree", "ball_tree"]:
+    matches = np.array_equal(brute_prediction, predictions_by_algorithm[algorithm])
+    print(f"Прогноз {algorithm} совпадает с brute: {matches}")
+pd.DataFrame(timing_rows).round(3)
+
+# In [67]
+from sklearn.datasets import make_moons
+X_example, y_example = make_moons(n_samples=50, random_state=6)
+X_example_train, X_example_test, y_example_train, y_example_test = train_test_split(X_example, y_example, random_state=6, test_size=5)
+X_example_train.shape, X_example_test.shape
+
+# In [68]
+import seaborn as sns
+cmap_bold = ["darkorange", "darkblue"]
+plt.figure(figsize=(6, 4))
+sns.scatterplot(x = X_example_train[:, 0], y = X_example_train[:, 1], hue = y_example_train, palette = cmap_bold, edgecolor = "black")
+plt.scatter(X_example_test[:, 0], X_example_test[:, 1], c='g', marker='s', s=100, label='тестовые объекты', edgecolor = "black")
+plt.xlabel('Признак 1'), plt.ylabel('Признак 2')
+plt.legend()
+plt.grid()
+
+# In [69]
+from sklearn.neighbors import KNeighborsClassifier
+n_neighbors = 20
+model = KNeighborsClassifier(n_neighbors = n_neighbors)
+model.fit(X_example_train, y_example_train)
+pred_test = model.predict(X_example_test)
+errors_mask = pred_test != y_example_test
+num_errors = np.sum(errors_mask)
+print('Предсказанные классы:', pred_test)
+print('Истинные классы: ', y_example_test)
+print('Количество ошибок: ', num_errors)
+print('Где ошиблись (индексы):', np.where(errors_mask)[0])
+
+# In [70]
+# Вычислим евклидово расстояние между всеми объектами
+# обучающей выборки и тестовым объектом.
+idx = 1
+test_dot = X_example_test[idx]
+distances = np.empty(0)
+for i, train_dot in enumerate(X_example_train):
+    d = np.linalg.norm(train_dot - test_dot, ord=2)
+    distances = np.append(distances, d)
+# Отсортируем расстояния по возрастанию
+# и найдем индексы 20 ближайших соседей.
+nearest_neighbors_idxs = distances.argsort()[:20]
+plt.figure(figsize=(7, 4))
+sns.scatterplot(x=X_example_train[:, 0],
+                y=X_example_train[:, 1],
+                hue=y_example_train,
+                palette=cmap_bold)
+plt.scatter(X_example_train[nearest_neighbors_idxs, 0],
+            X_example_train[nearest_neighbors_idxs, 1],
+            c='r', alpha=0.3, marker='o',
+            s=200, label='ближайшие соседи',
+            edgecolor = "black")
+plt.scatter(X_example_test[idx, 0], X_example_test[idx, 1],
+            c='g', marker='s', s=150,
+            label='тестовый объект',
+            edgecolor = "black")
+plt.xlabel('Признак 1'), plt.ylabel('Признак 2')
+plt.legend(fontsize = 9)
+
+# In [71]
+weighted_knn_model = Pipeline([("scaler", StandardScaler()),
+                               ("knn", KNeighborsClassifier(n_neighbors=best_k,
+                                                            weights = "distance",
+                                                            p = 2))])
+weighted_knn_model.fit(X_train, y_class_train)
+weighted_knn_model
+
+# In [72]
+# Создаём обычный kNN с одинаковыми весами соседей.
+uniform_knn_model = Pipeline([("scaler", StandardScaler()),
+                              ("knn", KNeighborsClassifier(n_neighbors=best_k,
+                                                           weights="uniform",
+                                                           p=2))])
+# Создаём взвешенный kNN.
+distance_knn_model = Pipeline([("scaler", StandardScaler()),
+                               ("knn", KNeighborsClassifier(n_neighbors=best_k,
+                                                            weights="distance",
+                                                            p=2))])
+weighting_results = []
+# Проверяем оба способа взвешивания на одинаковых блоках CV.
+for model_name, model in [
+    ("Одинаковые веса", uniform_knn_model),
+    ("Веса по расстоянию", distance_knn_model)
+]:
+    scores = cross_validate(estimator=model,
+                            X=X_train,
+                            y=y_class_train,
+                            cv=classification_cv,
+                            scoring={"precision": "precision",
+                                     "recall": "recall",
+                                     "f1": "f1"},
+                            return_train_score=False)
+    weighting_results.append({"Способ взвешивания": model_name,
+                              "Средняя Precision": scores["test_precision"].mean(),
+                              "Средняя Recall": scores["test_recall"].mean(),
+                              "Средняя F1": scores["test_f1"].mean(),
+                              "Стандартное отклонение F1": scores["test_f1"].std(ddof=0)})
+weighting_results_df = pd.DataFrame(weighting_results)
+weighting_results_df.round(4)
+
+# In [74]
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.model_selection import KFold
+# Создаем пятикратную KFold-валидацию.
+regression_cv = KFold(n_splits = 5, shuffle = True, random_state = 42)
+# Строим конвейер масштабирования и kNN-регрессии.
+regression_pipeline = Pipeline([("scaler", StandardScaler()), ("knn", KNeighborsRegressor())])
+# Подбираем те же основные гиперпараметры, но по ошибке регрессии.
+regression_param_grid = {"knn__n_neighbors": k_values, "knn__weights": ["uniform", "distance"], "knn__p": [1, 2]}
+regression_search = GridSearchCV(estimator = regression_pipeline, param_grid = regression_param_grid, scoring = "neg_mean_absolute_error", cv = regression_cv, return_train_score = True)
+regression_search.fit(X_train, y_reg_train)
+# sklearn максимизирует отрицательную MAE, поэтому меняем знак для интерпретации.
+best_cv_mae = -regression_search.best_score_
+print("Лучшие параметры:", regression_search.best_params_)
+print(f"Средняя MAE на CV: {best_cv_mae:.2f} мин")
+regression_cv_results = pd.DataFrame(regression_search.cv_results_)
+regression_top_columns = ["param_knn__n_neighbors", "param_knn__weights", "param_knn__p", "mean_train_score", "mean_test_score", "std_test_score"]
+regression_top = (regression_cv_results
+                  .sort_values("rank_test_score")
+                  .loc[:, regression_top_columns]
+                  .head(8)
+                  .copy())
+regression_top["mean_train_score"] *= -1
+regression_top["mean_test_score"] *= -1
+regression_top
+
+# In [75]
+best_regression_model = regression_search.best_estimator_
+y_reg_pred = best_regression_model.predict(X_test)
+y_reg_pred[:5]
+
+# In [79]
+from sklearn.metrics import (mean_absolute_error, mean_squared_error, r2_score)
+# Вычисляем метрики в исходной шкале времени.
+test_mae = mean_absolute_error(y_reg_test, y_reg_pred)
+test_rmse = np.sqrt(mean_squared_error(y_reg_test, y_reg_pred))
+test_r2 = r2_score(y_reg_test, y_reg_pred)
+print(f"MAE:  {test_mae:.2f} мин")
+print(f"RMSE: {test_rmse:.2f} мин")
+print(f"R2:   {test_r2:.3f}")
+
+# In [81]
+residuals = y_reg_test.to_numpy() - y_reg_pred
+fig, axes = plt.subplots(1, 2, figsize=(8, 5))
+axes[0].scatter(y_reg_test, y_reg_pred, alpha=0.65, color="slateblue")
+diagonal_min = min(y_reg_test.min(), y_reg_pred.min())
+diagonal_max = max(y_reg_test.max(), y_reg_pred.max())
+axes[0].plot([diagonal_min, diagonal_max],
+             [diagonal_min, diagonal_max],
+             linestyle="--", color="black",
+             label="Идеальный прогноз")
+axes[0].set_xlabel("Фактическое время, мин")
+axes[0].set_ylabel("Прогноз kNN, мин")
+axes[0].set_title("Факт и прогноз")
+axes[0].legend()
+axes[1].hist(residuals, bins=22, color="teal", edgecolor="black", alpha=0.8)
+axes[1].axvline(0, color="black", linestyle="--")
+axes[1].set_xlabel("Остаток: факт − прогноз, мин")
+axes[1].set_ylabel("Количество сессий")
+axes[1].set_title("Распределение ошибок")
+plt.tight_layout()
+
+# ============================================================
+# Лекция 1. Методы кластеризации для выявления аномалий. Метод k-means
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
+from yellowbrick.cluster import KElbowVisualizer, SilhouetteVisualizer
+
+df = pd.read_csv('/content/cybersecurity_kmeans_dataset.csv', parse_dates=['timestamp'])
+df.head()
+
+part_summary = (df.groupby("dataset_part")
+                .agg(events=("event_id", "size"), attacks=("is_attack", "sum"))
+                .assign(attack_share=lambda x: x["attacks"] / x["events"]))
+print(part_summary)
+print("\nСценарии monitoring:")
+print(df.loc[df["dataset_part"].eq("monitoring"), "attack_type"].value_counts())
+
+train_df = df[df["dataset_part"].eq("train")].copy()
+role_colors = {"workstation": "#4C78A8", "web_server": "#F58518", "backup_server": "#54A24B"}
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+for role, color in role_colors.items():
+    part = train_df[train_df["asset_role"].eq(role)]
+    axes[0].scatter(part["connections_per_min"], part["unique_destinations"], s=18, alpha=0.6, color=color, label=role)
+    axes[1].scatter(part["outbound_mb"], part["session_duration_sec"], s=18, alpha=0.6, color=color, label=role)
+axes[0].set(xlabel="Соединения в минуту", ylabel="Уникальные назначения", title="Сетевая активность")
+axes[1].set(xlabel="Исходящий трафик, МБ", ylabel="Длительность, с", title="Объём и длительность")
+for ax in axes:
+    ax.grid(alpha=0.25)
+axes[0].legend()
+plt.tight_layout()
+
+RANDOM_STATE = 42
+FEATURES = ["connections_per_min", "unique_destinations", "failed_logins", "outbound_mb", "session_duration_sec"]
+
+calibration_df = df[df["dataset_part"].eq("calibration")].copy()
+monitoring_df = df[df["dataset_part"].eq("monitoring")].copy()
+scaler = StandardScaler()
+X_train = scaler.fit_transform(train_df[FEATURES])
+X_calibration = scaler.transform(calibration_df[FEATURES])
+X_monitoring = scaler.transform(monitoring_df[FEATURES])
+scaling_parameters = pd.DataFrame({"feature": FEATURES, "train_mean": scaler.mean_, "train_scale": scaler.scale_})
+scaling_parameters
+
+kmeans_random = KMeans(n_clusters=3, init="random", max_iter=300, tol=1e-4, random_state=RANDOM_STATE, algorithm="lloyd")
+train_clusters = kmeans_random.fit_predict(X_train)
+print("Random init - inertia:", round(kmeans_random.inertia_, 3))
+print("Random init - iterations:", kmeans_random.n_iter_)
+
+kmeans = KMeans(n_clusters=3, init="k-means++", n_init=20, max_iter=300, tol=1e-4, random_state=RANDOM_STATE, algorithm="lloyd")
+train_clusters = kmeans.fit_predict(X_train)
+print("k-means++ - inertia:", round(kmeans.inertia_, 3))
+print("k-means++ - iterations:", kmeans.n_iter_)
+
+centers_original = pd.DataFrame(scaler.inverse_transform(kmeans_random.cluster_centers_), columns=FEATURES)
+centers_original.index.name = "cluster"
+print("Центры кластеров в исходных единицах:")
+display(centers_original.round(2))
+
+cluster_colors = ["#4C78A8", "#F58518", "#54A24B"]
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+for cluster_id, color in enumerate(cluster_colors):
+    mask = train_clusters == cluster_id
+    axes[0].scatter(train_df.loc[mask, "connections_per_min"], train_df.loc[mask, "unique_destinations"], s=18, alpha=0.6, color=color, label=f"cluster {cluster_id}")
+    axes[1].scatter(train_df.loc[mask, "outbound_mb"], train_df.loc[mask, "session_duration_sec"], s=18, alpha=0.6, color=color, label=f"cluster {cluster_id}")
+axes[0].scatter(centers_original["connections_per_min"], centers_original["unique_destinations"], s=150, marker="o", color="black", label="центроиды")
+axes[1].scatter(centers_original["outbound_mb"], centers_original["session_duration_sec"], s=150, marker="o", color="black", label="центроиды")
+axes[0].set(xlabel="Соединения в минуту", ylabel="Уникальные назначения", title="Кластеры: сетевая активность")
+axes[1].set(xlabel="Исходящий трафик, МБ", ylabel="Длительность, с", title="Кластеры: объём и длительность")
+for ax in axes:
+    ax.grid(alpha=0.25)
+    ax.legend()
+plt.tight_layout()
+
+cluster_role_table = pd.crosstab(pd.Series(train_clusters, name="cluster"), train_df["asset_role"].reset_index(drop=True))
+print("\nСостав кластеров по контрольной роли узла:")
+cluster_role_table
+
+k = 3
+model = KMeans(n_clusters=k, n_init=20, random_state=42)
+labels = model.fit_predict(X_train)
+print(f"Метрики качества кластеризации:\n"
+      f"k: {k}\n"
+      f"inertia: {model.inertia_}\n"
+      f"silhouette: {silhouette_score(X_train, labels)}\n"
+      f"calinski_harabasz: {calinski_harabasz_score(X_train, labels)}\n"
+      f"davies_bouldin: {davies_bouldin_score(X_train, labels)}")
+
+metrics_rows = []
+for k in range(1, 9):
+    model = KMeans(n_clusters=k, n_init=20, random_state=42)
+    labels = model.fit_predict(X_train)
+    row = {"K": k, "inertia": model.inertia_}
+    if k >= 2:
+        row["silhouette"] = silhouette_score(X_train, labels)
+        row["calinski_harabasz"] = calinski_harabasz_score(X_train, labels)
+        row["davies_bouldin"] = davies_bouldin_score(X_train, labels)
+    metrics_rows.append(row)
+metrics_df = pd.DataFrame(metrics_rows)
+metrics_df
+
+fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+axes[0, 0].plot(metrics_df["K"], metrics_df["inertia"], marker="o")
+axes[0, 0].set_title("Инерция")
+axes[0, 1].plot(metrics_df["K"], metrics_df["silhouette"], marker="o")
+axes[0, 1].set_title("Коэффициент силуэта")
+axes[1, 0].plot(metrics_df["K"], metrics_df["calinski_harabasz"], marker="o")
+axes[1, 0].set_title("Индекс Калински – Харабаша")
+axes[1, 1].plot(metrics_df["K"], metrics_df["davies_bouldin"], marker="o")
+axes[1, 1].set_title("Индекс Дэвиса – Болдина")
+for ax in axes.ravel():
+    ax.set_xlabel("Количество кластеров k")
+    ax.grid(alpha=0.3)
+plt.tight_layout()
+
+K = metrics_df['K']
+inertia = metrics_df['inertia']
+plt.figure(figsize=(6, 4))
+plt.plot(K, inertia, marker='o', linewidth=2, markersize=8, color='#2E86AB')
+plt.title('Инерция', fontsize=12)
+plt.xlabel('Количество кластеров (k)', fontsize=12)
+
+import pandas as pd
+import numpy as np
+w = metrics_df['inertia'].values
+ks_valid = range(2, len(w))
+D_k = []
+for k in ks_valid:
+    idx = k - 1
+    D = abs(w[idx] - w[idx+1]) / abs(w[idx-1] - w[idx])
+    D_k.append(D)
+    print(f'Критерий D для {k} кластеров: {D:.6f}')
+
+plt.figure(figsize=(6, 4))
+from yellowbrick.cluster import KElbowVisualizer
+visualizer = KElbowVisualizer(kmeans, k=(2, 9), timings=False)
+visualizer.fit(X_train)
+visualizer.show()
+
+K = metrics_df['K']
+inertia = metrics_df['silhouette']
+plt.figure(figsize=(6, 4))
+plt.plot(K, inertia, marker='o', linewidth=2, markersize=8, color='#2E86AB')
+plt.title('Коэффициент силуэта', fontsize=12)
+plt.xlabel('Количество кластеров (k)', fontsize=12)
+
+plt.figure(figsize=(6, 4))
+from yellowbrick.cluster import KElbowVisualizer
+visualizer = KElbowVisualizer(kmeans, k=(2, 9), metric='silhouette', timings=False)
+visualizer.fit(X_train)
+visualizer.show()
+
+from yellowbrick.cluster import SilhouetteVisualizer
+for k in range(2, 9):
+    fig = plt.figure(figsize=(4, 4))
+
+K = metrics_df['K']
+inertia = metrics_df['calinski_harabasz']
+plt.figure(figsize=(6, 4))
+plt.plot(K, inertia, marker='o', linewidth=2, markersize=8, color='#2E86AB')
+plt.title('Индекс Калински – Харабаша', fontsize=12)
+plt.xlabel('Количество кластеров (k)', fontsize=12)
+
+K = metrics_df['K']
+inertia = metrics_df['davies_bouldin']
+plt.figure(figsize=(6, 4))
+plt.plot(K, inertia, marker='o', linewidth=2, markersize=8, color='#2E86AB')
+plt.title('davies_bouldin', fontsize=12)
+plt.xlabel('Количество кластеров (k)', fontsize=12)
+
+# Масштабирование всей анализируемой выборки
+scaler = StandardScaler()
+X = scaler.fit_transform(df[FEATURES])
+
+# Кластеризация всей выборки
+kmeans = KMeans(n_clusters=3, init="k-means++", n_init=20, random_state=42)
+clusters = kmeans.fit_predict(X)
+
+# Расстояния объектов до всех центроидов
+distances = kmeans.transform(X)
+
+# Расстояние до назначенного центроида
+anomaly_scores = distances[np.arange(len(X)), clusters]
+
+results = df[['event_id']].copy()
+results["cluster"] = clusters
+results["anomaly_score"] = anomaly_scores
+
+new_events = pd.DataFrame({
+    "connections_per_min": [32],
+    "unique_destinations": [14],
+    "failed_logins": [1],
+    "outbound_mb": [10.5],
+    "session_duration_sec": [210]
+})
+
+X_new = scaler.transform(new_events[FEATURES])
+
+distances_to_centroids = kmeans.transform(X_new)
+print(distances_to_centroids)
+
+new_clusters = kmeans.predict(X_new)
+predicted_profiles = [cluster_profiles[cluster_id] for cluster_id in new_clusters]
+print(f'Номер кластера: {new_clusters}')
+print(f'Профиль кластера: {predicted_profiles}')
+
+distances_to_centroids
+
+anomaly_scores = distances_to_centroids.min(axis=1)
+print(anomaly_scores)
+
+thresholds = {0: 0.88, 1: 0.77, 2: 0.79}
+
+object_thresholds = np.array([thresholds[cluster_id] for cluster_id in new_clusters])
+
+predicted_anomaly = (anomaly_scores > object_thresholds).astype(int)
+predicted_anomaly
+
+new_results = new_events.copy()
+new_results["cluster"] = new_clusters
+new_results["profile"] = predicted_profiles
+new_results["anomaly_score"] = anomaly_scores
+new_results["threshold"] = object_thresholds
+new_results["predicted_anomaly"] = predicted_anomaly
+new_results
+
+# ============================================================
+# Лекция 2. Методы кластеризации для выявления аномалий. Иерархическая кластеризация
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+FEATURES = ["connections_per_min", "unique_destinations", "failed_logins", "outbound_mb", "session_duration_sec"]
+
+df = pd.read_csv("/content/cybersecurity_hierarchical_dataset.csv", parse_dates=["timestamp"])
+df.head()
+
+part_summary = (df.groupby("dataset_part")
+                .agg(events=("event_id", "size"), attacks=("is_attack", "sum"))
+                .assign(attack_share=lambda table: table["attacks"] / table["events"]))
+print(part_summary)
+print("\nСценарии:")
+print(df["attack_type"].value_counts())
+
+train_df = df[df["dataset_part"].eq("train")].copy()
+
+role_colors = {"workstation": "#4C78A8", "admin_workstation": "#B279A2", "web_server": "#F58518", "backup_server": "#54A248"}
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+for role, color in role_colors.items():
+    part = train_df[train_df["asset_role"].eq(role)]
+    axes[0].scatter(part["connections_per_min"], part["unique_destinations"], s=20, alpha=0.6, color=color, label=role)
+    axes[1].scatter(part["outbound_mb"], part["session_duration_sec"], s=20, alpha=0.6, color=color, label=role)
+axes[0].set(xlabel="Соединения в минуту", ylabel="Уникальные назначения", title="Сетевая активность train")
+axes[1].set(xlabel="Исходящий трафик, МБ", ylabel="Длительность, с", title="Объём и длительность train")
+for ax in axes:
+    ax.grid(alpha=0.25)
+axes[0].legend(fontsize=10)
+plt.tight_layout()
+
+from scipy.spatial.distance import pdist, squareform
+
+condensed_distances = pdist(X_train, metric="euclidean")
+distance_matrix = squareform(condensed_distances)
+
+print("Форма сокращённого вектора:", condensed_distances.shape)
+print("Форма матрицы расстояний:", distance_matrix.shape)
+
+condensed_distances
+
+distance_matrix
+
+from scipy.cluster.hierarchy import linkage
+
+Z_ward = linkage(X_train, method="ward", metric="euclidean", optimal_ordering=True)
+
+from scipy.cluster.hierarchy import dendrogram
+
+plt.figure(figsize=(8, 6))
+dendrogram(Z_ward)
+plt.axhline(y=0.7*np.max(Z_ward[:,2]), color="black", linestyle="-", label="Отсечение на высоте \n$0.7*max(Z[:,2])$")
+plt.xlabel("Объекты train")
+plt.ylabel("Высота объединения Ward")
+plt.title("Полная дендрограмма нормальной активности")
+plt.legend()
+plt.grid(axis="y", alpha=0.25)
+plt.tight_layout()
+
+plt.figure(figsize=(8, 6))
+dendrogram(Z_ward, truncate_mode="lastp", p=20, show_contracted=True, leaf_rotation=45, leaf_font_size=9)
+plt.axhline(y=0.7*np.max(Z_ward[:,2]), color="black", linestyle="--", label="Отсечение на высоте \n$0.7*max(Z[:,2])$")
+plt.xlabel("Последние ветви иерархии")
+plt.ylabel("Высота объединения Ward")
+plt.title("Усечённая дендрограмма: последние объединения")
+plt.legend()
+plt.grid(axis="y", alpha=0.25)
+plt.tight_layout()
+
+from scipy.cluster.hierarchy import fcluster
+
+cluster_numbers = fcluster(Z_ward, t=0.7*np.max(Z_ward[:,2]), criterion="distance")
+cluster_numbers
+
+plt.figure(figsize=(7, 6))
+dendrogram(Z_ward, truncate_mode="lastp", p=20, show_contracted=True, leaf_rotation=45, leaf_font_size=9)
+plt.axhline(y=0.7*np.max(Z_ward[:,2]), color="black", linestyle="--", label="Отсечение на высоте \n$0.7*max(Z[:,2])$")
+plt.xlabel("Последние ветви иерархии")
+plt.ylabel("Высота объединения Ward")
+plt.title("Усечённая дендрограмма: последние объединения")
+plt.legend()
+plt.grid(axis="y", alpha=0.25)
+plt.tight_layout()
+
+plt.figure(figsize=(7, 5))
+dendrogram(Z_ward, color_threshold=10, truncate_mode="lastp", p=20, show_contracted=True, leaf_rotation=45, leaf_font_size=9)
+plt.axhline(y=10, color="black", linestyle="-", label="Отсечение на высоте 10")
+plt.xlabel("Последние ветви иерархии")
+plt.ylabel("Высота объединения Ward")
+plt.title("Усечённая дендрограмма: последние объединения")
+plt.legend()
+plt.grid(axis="y", alpha=0.25)
+plt.tight_layout()
+
+cluster_numbers = fcluster(Z_ward, t=10, criterion="distance")
+cluster_numbers
+
+cluster_ids = np.sort(np.unique(cluster_numbers))
+
+centroids_scaled = np.vstack([X_train[cluster_numbers == cid].mean(axis=0) for cid in cluster_ids])
+
+centroids_original = scaler.inverse_transform(centroids_scaled)
+
+centroids_df = pd.DataFrame(centroids_original, columns=FEATURES)
+centroids_df["cluster_id"] = cluster_ids
+centroids_df["size"] = [np.sum(cluster_numbers == cid) for cid in cluster_ids]
+
+cols = ["cluster_id", "size"] + FEATURES
+centroids_df = centroids_df[cols].round(2)
+
+centroids_df
+
+from scipy.cluster.hierarchy import cophenet
+
+coefficient, _ = cophenet(Z_ward, condensed_distances)
+print(f"Кофенетическая корреляция: {coefficient:.3f}")
+
+linkage_rows = []
+linkage_matrices = {}
+
+for method in ["single", "complete", "average", "ward"]:
+    Z = linkage(X_train, method=method, metric="euclidean")
+    coefficient, _ = cophenet(Z, condensed_distances)
+    linkage_matrices[method] = Z
+    linkage_rows.append({"linkage": method,
+                         "cophenetic_correlation": coefficient})
+
+linkage_quality = pd.DataFrame(linkage_rows)
+linkage_quality.round(3)
+
+from sklearn.metrics import (silhouette_score, calinski_harabasz_score, davies_bouldin_score)
+
+metric_rows = []
+
+for k in range(2, 9):
+    cluster_labels = fcluster(Z_ward, t=k, criterion="maxclust")
+    silhouette = silhouette_score(X_train, cluster_labels, metric="euclidean")
+    calinski_harabasz = calinski_harabasz_score(X_train, cluster_labels)
+    davies_bouldin = davies_bouldin_score(X_train, cluster_labels)
+    metric_rows.append({"k": k,
+                        "silhouette": silhouette,
+                        "calinski_harabasz": calinski_harabasz,
+                        "davies_bouldin": davies_bouldin})
+
+metrics_df = pd.DataFrame(metric_rows)
+metrics_df.round(3)
+
+fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(15, 4.5))
+axes[0].plot(metrics_df["k"], metrics_df["silhouette"], marker="o", linewidth=2)
+axes[0].set_title("Коэффициент силуэта")
+axes[0].set_ylabel("Больше – лучше")
+axes[1].plot(metrics_df["k"], metrics_df["calinski_harabasz"], marker="o", linewidth=2)
+axes[1].set_title("Индекс Калински–Харабаша")
+axes[1].set_ylabel("Больше – лучше")
+axes[2].plot(metrics_df["k"], metrics_df["davies_bouldin"], marker="o", linewidth=2)
+axes[2].set_title("Индекс Дэвиса–Болдина")
+axes[2].set_ylabel("Меньше – лучше")
+for ax in axes:
+    ax.set_xlabel("Количество кластеров k")
+    ax.set_xticks(metrics_df["k"])
+    ax.grid(alpha=0.25)
+plt.tight_layout()
+
+from sklearn.cluster import AgglomerativeClustering
+
+hierarchical_model = AgglomerativeClustering(n_clusters=4, metric="euclidean", linkage="ward", compute_full_tree=True, compute_distances=True)
+train_clusters = hierarchical_model.fit_predict(X_train)
+print("Номера кластеров:", hierarchical_model.labels_)
+
+train_labels = fcluster(Z_ward, t=4, criterion="maxclust")
+
+train_result = train_df.copy()
+train_result["cluster"] = train_labels
+train_result["cluster"]
+
+cluster_ids = np.sort(np.unique(train_labels))
+
+cluster_centroids = np.vstack([X_train[train_labels == cluster_id].mean(axis=0) for cluster_id in cluster_ids])
+
+cluster_sizes = np.array([np.sum(train_labels == cluster_id) for cluster_id in cluster_ids])
+
+centroids_df = pd.DataFrame(cluster_centroids, columns=FEATURES)
+centroids_df["cluster_id"] = cluster_ids
+cols = ["cluster_id"] + FEATURES
+centroids_df = centroids_df[cols]
+centroids_df
+
+new_object = pd.DataFrame({"connections_per_min": [28],
+                           "unique_destinations": [11],
+                           "failed_logins": [1],
+                           "outbound_mb": [10],
+                           "session_duration_sec": [200]})
+new_object
+
+X_new = scaler.transform(new_object[FEATURES])
+print("Стандартизированный объект:")
+print(X_new)
+
+distances = np.linalg.norm(cluster_centroids - X_new[0], axis=1)
+distance_table = pd.DataFrame({"cluster": cluster_ids, "distance_to_centroid": distances})
+distance_table.sort_values("distance_to_centroid").round(3)
+
+nearest_position = np.argmin(distances)
+assigned_cluster = cluster_ids[nearest_position]
+minimum_distance = distances[nearest_position]
+print("Назначенный кластер:", assigned_cluster)
+print("Расстояние до его центроида:", round(minimum_distance, 3))
+
+squared_distances = distances ** 2
+ward_increase = (cluster_sizes / (cluster_sizes + 1)) * squared_distances
+ward_table = pd.DataFrame({"cluster": cluster_ids, "cluster_size": cluster_sizes, "distance": distances, "ward_increase": ward_increase})
+ward_table.sort_values("ward_increase").round(3)
+
+best_position = np.argmin(ward_increase)
+assigned_cluster = cluster_ids[best_position]
+print(f"Кластер по критерию Уорда: {assigned_cluster} - рабочие станции")
+
+plt.xlabel("Последние ветви иерархии")
+plt.ylabel("Высота объединения Ward")
+plt.title("Иерархия всей анализируемой выборки")
+plt.grid(axis="y", alpha=0.25)
+plt.tight_layout()
+
+ANALYSIS_CLUSTERS = 7
+
+analysis_clusters = fcluster(Z_analysis, t=ANALYSIS_CLUSTERS, criterion="maxclust")
+analysis_results = analysis_df.copy()
+analysis_results["cluster"] = analysis_clusters
+analysis_results.head(2)
+
+cluster_sizes = (analysis_results["cluster"].value_counts().sort_index())
+
+analysis_results["cluster_size"] = (analysis_results["cluster"].map(cluster_sizes))
+
+cluster_sizes.rename_axis("cluster").reset_index(name="object_count")
+analysis_results.head(2)
+
+MIN_CLUSTER_SIZE = 30
+
+MIN_CLUSTER_SHARE = 0.05
+
+analysis_results["cluster_share"] = (analysis_results["cluster_size"] / len(analysis_results))
+
+analysis_results["rare_cluster"] = (analysis_results["cluster_share"] < MIN_CLUSTER_SHARE).astype(int)
+
+analysis_results.head(2)
+
+cluster_ids = np.sort(np.unique(analysis_clusters))
+
+cluster_centroids = {cluster_id: X_analysis[analysis_clusters == cluster_id].mean(axis=0) for cluster_id in cluster_ids}
+
+anomaly_scores = np.array([np.linalg.norm(X_analysis[row_number] - cluster_centroids[cluster_id]) for row_number, cluster_id in enumerate(analysis_clusters)])
+analysis_results["anomaly_score"] = anomaly_scores
+analysis_results.head(2)
+
+ALPHA = 0.01
+MIN_CLUSTER_SIZE = 30
+
+cluster_thresholds = {}
+
+for cluster_id, cluster_size in cluster_sizes.items():
+    if cluster_size < MIN_CLUSTER_SIZE:
+        continue
+    mask = analysis_results["cluster"] == cluster_id
+    cluster_scores = analysis_results.loc[mask, "anomaly_score"]
+    cluster_thresholds[cluster_id] = np.quantile(cluster_scores, 1 - ALPHA)
+
+print("Пороги крупных кластеров:")
+cluster_thresholds
+
+analysis_results["rare_cluster"] = (analysis_results["cluster_size"] < MIN_CLUSTER_SIZE).astype(int)
+
+analysis_results["distance_anomaly"] = [int(cluster_id in cluster_thresholds and score > cluster_thresholds[cluster_id]) for cluster_id, score in zip(analysis_results["cluster"], analysis_results["anomaly_score"])]
+
+analysis_results["predicted_anomaly"] = (analysis_results["rare_cluster"] | analysis_results["distance_anomaly"]).astype(int)
+
+analysis_results.head(2)
+
+analysis_results[["event_id", "host_id", "cluster", "cluster_size", "anomaly_score", "rare_cluster", "distance_anomaly", "predicted_anomaly"]].sort_values(["predicted_anomaly", "rare_cluster", "anomaly_score"], ascending=False)
+
+from sklearn.metrics import confusion_matrix, precision_score, recall_score
+
+y_true = analysis_results["is_attack"]
+y_pred = analysis_results["predicted_anomaly"]
+
+labels1 = ["норма", "атака"]
+labels2 = ["норма", "аномалия"]
+
+cm = confusion_matrix(y_true, y_pred)
+cm_df = pd.DataFrame(cm, index=[f"истина_{l}" for l in labels1], columns=[f"предсказание_{l}" for l in labels2])
+
+precision = precision_score(y_true, y_pred)
+recall = recall_score(y_true, y_pred)
+
+print(f"Точность (Precision): {precision:.4f}")
+print(f"Полнота (Recall): {recall:.4f}")
+cm_df
+
+train_df = df[(df["dataset_part"] == "train") & (df["is_attack"] == 0)].reset_index(drop=True)
+
+calibration_df = df[(df["dataset_part"] == "calibration") & (df["is_attack"] == 0)].reset_index(drop=True)
+
+monitoring_df = df[df["dataset_part"] == "monitoring"].reset_index(drop=True)
+
+normal_scaler = StandardScaler()
+
+X_train = normal_scaler.fit_transform(train_df[FEATURES])
+X_calibration = normal_scaler.transform(calibration_df[FEATURES])
+X_monitoring = normal_scaler.transform(monitoring_df[FEATURES])
+
+Z_normal = linkage(X_train, method="ward", metric="euclidean", optimal_ordering=True)
+
+NORMAL_CLUSTERS = 4
+
+train_clusters = fcluster(Z_normal, t=NORMAL_CLUSTERS, criterion="maxclust")
+
+normal_cluster_ids = np.sort(np.unique(train_clusters))
+
+normal_centroids = np.vstack([X_train[train_clusters == cluster_id].mean(axis=0) for cluster_id in normal_cluster_ids])
+normal_centroids
+
+def assign_to_nearest_cluster(X, cluster_ids, centroids):
+    distance_matrix = np.linalg.norm(X[:, np.newaxis, :] - centroids[np.newaxis, :, :], axis=2)
+    nearest_positions = np.argmin(distance_matrix, axis=1)
+    assigned_clusters = cluster_ids[nearest_positions]
+    anomaly_scores = distance_matrix[np.arange(len(X)), nearest_positions]
+    return assigned_clusters, anomaly_scores
+
+calibration_clusters, calibration_scores = assign_to_nearest_cluster(X_calibration, normal_cluster_ids, normal_centroids)
+
+calibration_result = calibration_df.copy()
+calibration_result["assigned_cluster"] = calibration_clusters
+calibration_result["anomaly_score"] = calibration_scores
+calibration_result.head(2)
+
+ALPHA = 0.01
+
+cluster_thresholds = (calibration_result.groupby("assigned_cluster")["anomaly_score"].quantile(1 - ALPHA))
+cluster_thresholds.rename("threshold").reset_index()
+
+monitoring_clusters, monitoring_scores = assign_to_nearest_cluster(X_monitoring, normal_cluster_ids, normal_centroids)
+
+monitoring_result = monitoring_df.copy()
+monitoring_result["assigned_cluster"] = monitoring_clusters
+monitoring_result["anomaly_score"] = monitoring_scores
+
+monitoring_result["threshold"] = (monitoring_result["assigned_cluster"].map(cluster_thresholds))
+
+monitoring_result["predicted_anomaly"] = (monitoring_result["anomaly_score"] > monitoring_result["threshold"]).astype(int)
+
+monitoring_result[["event_id", "host_id", "assigned_cluster", "anomaly_score", "threshold", "predicted_anomaly"]].sort_values("anomaly_score", ascending=False)
+
+y_true = monitoring_result["is_attack"]
+y_pred = monitoring_result["predicted_anomaly"]
+
+labels1 = ["норма", "атака"]
+labels2 = ["норма", "аномалия"]
+cm = confusion_matrix(y_true, y_pred)
+
+cm_df = pd.DataFrame(cm, index=[f"истина_{l}" for l in labels1], columns=[f"предсказание_{l}" for l in labels2])
+
+precision = precision_score(y_true, y_pred)
+recall = recall_score(y_true, y_pred)
+
+print(f"Точность (Precision): {precision:.4f}")
+print(f"Полнота (Recall): {recall:.4f}")
+cm_df
