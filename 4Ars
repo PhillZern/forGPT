@@ -1,0 +1,371 @@
+Ниже — весь код из документа, собранный по порядку, с результатами выполнения там, где они приведены.
+
+## 1. Импорты и загрузка данных
+
+```python
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+from sklearn.metrics import (
+    ConfusionMatrixDisplay,
+    accuracy_score,
+    f1_score,
+    mean_absolute_error,
+    mean_squared_error,
+    precision_score,
+    r2_score,
+    recall_score,
+)
+from sklearn.model_selection import GridSearchCV, KFold, StratifiedKFold
+from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+RANDOM_STATE = 42
+```
+
+```python
+data_path = "network_sessions_knn_practice.csv"
+df = pd.read_csv(data_path)
+df.head()
+```
+
+**Результат (Out[4]):** таблица с колонками `duration_s, bytes_kb, failed_logins, unique_dst_ports, connections_per_min, source_risk_score, off_hours, payload_entropy, is_attack, investigation_time_min` (первая строка: 0.914, 84.0, 8, 10, 15.9, 10.6, 1, 7.9, 0, 21.8 и т.д.).
+
+## 2. Проверка данных, признаки и целевые переменные
+
+```python
+feature_columns = [
+    "duration_s",
+    "bytes_kb",
+    "failed_logins",
+    "unique_dst_ports",
+    "connections_per_min",
+    "source_risk_score",
+    "off_hours",
+    "payload_entropy",
+]
+print("Размер таблицы:")
+print(df.shape)
+print("\nТипы данных:")
+print(df.dtypes)
+print("\nКоличество пропусков:")
+print(df.isna().sum())
+print("\nКоличество полных дубликатов:", df.duplicated().sum())
+print()
+
+class_counts = df["is_attack"].value_counts().sort_index()
+print(class_counts.rename(index={0: "Легитимная сессия", 1: "Атака"}))
+
+X = df[feature_columns].copy()
+```
+
+**Результат:**
+```
+Размер таблицы: (900, 10)
+Типы данных:
+duration_s              float64
+bytes_kb                float64
+failed_logins             int64
+unique_dst_ports          int64
+connections_per_min     float64
+source_risk_score       float64
+off_hours                 int64
+payload_entropy         float64
+is_attack                 int64
+investigation_time_min  float64
+dtype: object
+Количество пропусков: все 0
+Количество полных дубликатов: 0
+is_attack
+Легитимная сессия    646
+Атака                254
+```
+
+> Примечание: в документе разделение на train/test (75/25 со стратификацией) описано в задании, но код `train_test_split` в извлечённом тексте не приведён. Результаты ниже: `Обучающая выборка: (675, 8)`, `Тестовая выборка: (225, 8)`, `Доля атак в train: 0.283`, `Доля атак в test: 0.28`.
+
+**Ответ о масштабировании (из документа):** kNN опирается на расстояния, поэтому признаки разных масштабов нужно стандартизировать. Параметры `StandardScaler` (μ и σ) вычисляются только по обучающей выборке; иначе произойдёт утечка информации о тестовых данных. Поэтому `StandardScaler` помещают внутрь `Pipeline` — на каждой итерации CV он настраивается только по обучающим блокам текущего фолда.
+
+## 3. Подбор kNN-классификатора
+
+```python
+k_values = [1, 3, 5, 7, 9, 11, 15, 21, 31, 41]
+
+cv_cls = StratifiedKFold(
+    n_splits=5,
+    shuffle=True,
+    random_state=RANDOM_STATE,
+)
+
+clf_pipe = Pipeline([
+    ("scaler", StandardScaler()),
+    ("knn", KNeighborsClassifier()),
+])
+clf_pipe
+```
+
+```python
+param_grid_cls = {
+    "knn__n_neighbors": k_values,
+    "knn__weights": ["uniform", "distance"],
+    "knn__p": [1, 2],
+}
+
+clf_search = GridSearchCV(
+    estimator=clf_pipe,
+    param_grid=param_grid_cls,
+    scoring="f1",
+    cv=cv_cls,
+    return_train_score=True,
+)
+
+clf_search.fit(X_tr, y_cls_tr)
+
+print("Лучшие параметры:")
+print(clf_search.best_params_)
+print("\nЛучшая средняя F1 на CV:", round(clf_search.best_score_, 4))
+
+cv_res_cls = pd.DataFrame(clf_search.cv_results_)
+show_cols = [
+    "param_knn__n_neighbors",
+    "param_knn__weights",
+    "param_knn__p",
+    "mean_train_score",
+    "mean_test_score",
+    "std_test_score",
+]
+top8_cls = (
+    cv_res_cls
+    .sort_values("rank_test_score")
+    .loc[:, show_cols]
+    .head(8)
+)
+print("\nВосемь лучших комбинаций:")
+top8_cls.round(4)
+```
+
+**Результат:**
+```
+Лучшие параметры:
+{'knn__n_neighbors': 3, 'knn__p': 1, 'knn__weights': 'uniform'}
+Лучшая средняя F1 на CV: 0.9762
+```
+Восемь лучших комбинаций (n_neighbors, weights, p, mean_train, mean_test):
+- 3, distance, 1 → 1.0000
+- 3, uniform, 1 → 0.9895
+- 5, distance, 1 → 1.0000
+- 21, uniform, 1 → 0.9752
+- 21, distance, 1 → 1.0000
+- 15, distance, 1 → 1.0000
+- 3, uniform, 2 → 0.9816
+- 3, distance, 2 → 1.0000
+
+```python
+f1_by_k = (
+    cv_res_cls.groupby("param_knn__n_neighbors", as_index=False)["mean_test_score"]
+    .max()
+)
+f1_by_k["param_knn__n_neighbors"] = f1_by_k["param_knn__n_neighbors"].astype(int)
+f1_by_k = f1_by_k.sort_values("param_knn__n_neighbors")
+f1_by_k.head()
+```
+
+**Результат:**
+```
+0  1   0.967993
+1  3   0.976208
+2  5   0.973257
+3  7   0.970369
+4  9   0.970370
+```
+
+```python
+plt.figure(figsize=(8, 5))
+plt.plot(
+    f1_by_k["param_knn__n_neighbors"],
+    f1_by_k["mean_test_score"],
+    marker="o",
+)
+plt.xlabel("Количество соседей k")
+plt.ylabel("Лучшая средняя F1")
+plt.title("Зависимость качества классификации от k")
+plt.xticks(k_values)
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+```
+
+**График:** F1 растёт от k=1 (≈0.968) до максимума при k=3 (≈0.976), затем плавно снижается до ≈0.965 при k=41.
+
+## 4. Матрица ошибок и метрики классификации
+
+```python
+best_clf = clf_search.best_estimator_
+
+y_cls_pred = best_clf.predict(X_te)
+
+print("Первые прогнозы:")
+print(y_cls_pred[:10])
+
+acc = accuracy_score(y_cls_te, y_cls_pred)
+prec = precision_score(y_cls_te, y_cls_pred)
+rec = recall_score(y_cls_te, y_cls_pred)
+f1 = f1_score(y_cls_te, y_cls_pred)
+
+print(f"\nAccuracy: {acc:.3f}")
+print(f"Precision: {prec:.3f}")
+print(f"Recall: {rec:.3f}")
+print(f"F1: {f1:.3f}")
+print()
+
+disp = ConfusionMatrixDisplay.from_predictions(
+    y_cls_te,
+    y_cls_pred,
+    labels=[0, 1],
+    display_labels=["Легитимная", "Атака"],
+)
+plt.title("Матрица ошибок kNN-классификатора")
+plt.tight_layout()
+plt.show()
+
+tn, fp, fn, tp = disp.confusion_matrix.ravel()
+print("\nTN – легитимные сессии определены правильно: ", tn)
+print("FP – ложные тревоги: ", fp)
+print("FN – пропущенные атаки: ", fn)
+print("TP – правильно обнаруженные атаки: ", tp)
+```
+
+**Результат:**
+```
+Первые прогнозы: [0 0 0 0 0 0 0 0 0 0]
+Accuracy: 0.973
+Precision: 1.000
+Recall: 0.905
+F1: 0.950
+TN = 162, FP = 0, FN = 6, TP = 57
+```
+
+**Интерпретация (из документа):** для SOC одной Accuracy недостаточно из-за дисбаланса классов (атак ~28 %). Модель может показывать высокую точность, просто относя почти всё к легитимному классу. Нужны Precision, Recall и F1. Наиболее опасна ошибка FN — пропущенная атака, она не попадает к аналитику.
+
+## 5. kNN-регрессия времени расследования
+
+```python
+reg_pipe = Pipeline([
+    ("scaler", StandardScaler()),
+    ("knn", KNeighborsRegressor()),
+])
+
+cv_reg = KFold(
+    n_splits=5,
+    shuffle=True,
+    random_state=RANDOM_STATE,
+)
+
+param_grid_reg = {
+    "knn__n_neighbors": k_values,
+    "knn__weights": ["uniform", "distance"],
+    "knn__p": [1, 2],
+}
+
+reg_search = GridSearchCV(
+    estimator=reg_pipe,
+    param_grid=param_grid_reg,
+    scoring="neg_mean_absolute_error",
+    cv=cv_reg,
+    return_train_score=True,
+)
+
+reg_search.fit(X_tr, y_time_tr)
+
+mae_cv = -reg_search.best_score_
+print("Лучшие параметры:")
+print(reg_search.best_params_)
+print(f"\nСредняя MAE на CV: {mae_cv:.2f} мин")
+
+cv_res_reg = pd.DataFrame(reg_search.cv_results_)
+show_cols_reg = [
+    "param_knn__n_neighbors",
+    "param_knn__weights",
+    "param_knn__p",
+    "mean_train_score",
+    "mean_test_score",
+    "std_test_score",
+]
+top8_reg = (
+    cv_res_reg
+    .sort_values("rank_test_score")
+    .loc[:, show_cols_reg]
+    .head(8)
+    .copy()
+)
+top8_reg["mean_train_score"] *= -1
+top8_reg["mean_test_score"] *= -1
+top8_reg.round(3)
+
+best_reg = reg_search.best_estimator_
+
+y_time_pred = best_reg.predict(X_te)
+
+print("Первые пять прогнозов:")
+print(y_time_pred[:5])
+
+mae = mean_absolute_error(y_time_te, y_time_pred)
+rmse = np.sqrt(mean_squared_error(y_time_te, y_time_pred))
+r2 = r2_score(y_time_te, y_time_pred)
+
+print(f"MAE: {mae:.2f} min")
+print(f"RMSE: {rmse:.2f} min")
+print(f"R^2: {r2:.3f}")
+```
+
+**Результат:**
+```
+Лучшие параметры:
+{'knn__n_neighbors': 15, 'knn__p': 1, 'knn__weights': 'distance'}
+Средняя MAE на CV: 2.82 мин
+Первые пять прогнозов: [19.45 18.27 18.37 21.14 20.02]
+MAE: 2.81 мин
+RMSE: 3.50 мин
+R^2: 0.902
+```
+
+## 6. График «факт — прогноз» и гистограмма остатков
+
+```python
+plt.figure(figsize=(7, 5))
+plt.scatter(y_time_te, y_time_pred, alpha=0.65)
+lo = min(y_time_te.min(), y_time_pred.min())
+hi = max(y_time_te.max(), y_time_pred.max())
+plt.plot([lo, hi], [lo, hi], linestyle="--", label="Идеальный прогноз")
+plt.xlabel("Фактическое время расследования, мин")
+plt.ylabel("Прогноз kNN, мин")
+plt.title("Фактическое и прогнозируемое время")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# гистограмма остатков
+errs = y_time_te.to_numpy() - y_time_pred
+
+plt.figure(figsize=(7, 5))
+plt.hist(errs, bins=22)
+plt.axvline(0, linestyle="--")
+plt.xlabel("Остаток: факт - прогноз, мин")
+plt.ylabel("Количество сессий")
+plt.title("Распределение остатков")
+plt.tight_layout()
+plt.show()
+```
+
+**Интерпретация (из документа):** MAE ≈ 2.81 мин — типичная абсолютная ошибка; RMSE ≈ 3.50 мин сильнее штрафует крупные отклонения; R² ≈ 0.90 — модель объясняет около 90 % дисперсии времени расследования. На диаграмме «факт-прогноз» точки хорошо ложатся вдоль диагонали, остатки сосредоточены около нуля, явного сильного смещения нет (средний остаток ≈ 0.66 мин).
+
+## 7. Итоговая записка SOC
+
+- **Классификатор:** n_neighbors = 3, weights = uniform, p = 1 (манхэттенское расстояние). Средняя F1 на CV = 0.976.
+- **Качество классификации:** Accuracy = 0.973, Precision = 1.000, Recall = 0.905, F1 = 0.950; FP = 0, FN = 6. Наиболее опасна ошибка FN — пропуск реальной атаки.
+- **Регрессор:** n_neighbors = 15, weights = distance, p = 1. MAE = 2.81 мин, RMSE = 3.50 мин, R² = 0.902. Средний остаток ≈ 0.66 мин.
+- **Ограничение:** kNN чувствителен к масштабу и хранит всю обучающую выборку. **Рекомендация:** контролировать качество на новых данных и обновлять выборку.
